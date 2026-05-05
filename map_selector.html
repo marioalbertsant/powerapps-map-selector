@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RegionSelector Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: Segoe UI, sans-serif; background: #f8f8f8; }
+  #map { width: 100%; height: calc(100vh - 48px); }
+
+  #info-bar {
+    height: 48px;
+    background: #fff;
+    border-bottom: 1px solid #e0e0e0;
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    gap: 8px;
+    font-size: 13px;
+    color: #444;
+  }
+  #breadcrumb { flex: 1; color: #01696f; font-weight: 600; }
+  #btn-reset {
+    padding: 4px 12px;
+    background: #f0f0f0;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+    color: #555;
+    display: none;
+  }
+  #btn-reset:hover { background: #e0e0e0; }
+
+  .leaflet-popup-content-wrapper {
+    border-radius: 8px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+  }
+  .leaflet-popup-content { font-size: 13px; color: #333; }
+  .popup-title { font-weight: 700; font-size: 14px; color: #01696f; margin-bottom: 4px; }
+  .popup-sub { color: #888; font-size: 12px; }
+  .popup-btn {
+    margin-top: 8px;
+    padding: 5px 12px;
+    background: #01696f;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+    width: 100%;
+  }
+  .popup-btn:hover { background: #015a60; }
+</style>
+</head>
+<body>
+
+<div id="info-bar">
+  <span id="breadcrumb">Click a country to select</span>
+  <button id="btn-reset" onclick="resetSelection()">✕ Clear</button>
+</div>
+<div id="map"></div>
+
+<script>
+// ─── State ────────────────────────────────────────────────────────────────────
+var state = {
+  region: "",
+  subRegion: "",
+  countryCode: "",
+  countryName: ""
+};
+
+// ─── GeoData injected by Power Apps via URL param ────────────────────────────
+// Expected URL format: ?geoData=[{CountryCode,Region,SubRegion}]
+var geoLookup = {};   // { "PT": { Region, SubRegion } }
+
+function loadGeoData() {
+  try {
+    var params = new URLSearchParams(window.location.search);
+    var raw = params.get("geoData");
+    if (raw) {
+      var arr = JSON.parse(decodeURIComponent(raw));
+      arr.forEach(function(r) {
+        if (r.CountryCode) geoLookup[r.CountryCode.toUpperCase()] = r;
+      });
+    }
+  } catch(e) { console.warn("geoData parse error", e); }
+}
+
+// ─── Leaflet Map ──────────────────────────────────────────────────────────────
+var map = L.map("map", {
+  center: [20, 0],
+  zoom: 2,
+  minZoom: 1,
+  maxZoom: 6,
+  zoomControl: true
+});
+
+L.tileLayer("https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}{r}.png", {
+  attribution: "©OpenStreetMap ©CARTO",
+  subdomains: "abcd"
+}).addTo(map);
+
+// ─── GeoJSON World Countries ─────────────────────────────────────────────────
+// Uses Natural Earth low-res free dataset via CDN
+var geojsonLayer;
+var selectedLayer = null;
+
+var COLORS = {
+  default:     "#c8e6e7",
+  hover:       "#7fc8cb",
+  selected:    "#01696f",
+  sameRegion:  "#a8d5d1",
+  sameSub:     "#4db3b9"
+};
+
+function getCountryISO(feature) {
+  return (feature.properties.ISO_A2 ||
+          feature.properties.iso_a2 ||
+          feature.properties.ADM0_A3 || "").toUpperCase().substring(0,2);
+}
+
+function getStyle(feature) {
+  var iso = getCountryISO(feature);
+  var geo = geoLookup[iso];
+  if (!geo) return { fillColor: "#e8e8e8", weight: 0.5, color: "#fff", fillOpacity: 0.7 };
+
+  var fill = COLORS.default;
+  if (state.countryCode && iso === state.countryCode) fill = COLORS.selected;
+  else if (state.subRegion && geo.SubRegion === state.subRegion) fill = COLORS.sameSub;
+  else if (state.region && geo.Region === state.region) fill = COLORS.sameRegion;
+
+  return { fillColor: fill, weight: 0.8, color: "#fff", fillOpacity: 0.85 };
+}
+
+function onEachFeature(feature, layer) {
+  var iso = getCountryISO(feature);
+  var geo = geoLookup[iso];
+  if (!geo || !geo.Region) return;
+
+  layer.on({
+    mouseover: function(e) {
+      if (iso !== state.countryCode) {
+        e.target.setStyle({ fillColor: COLORS.hover, fillOpacity: 1 });
+      }
+      e.target.bringToFront();
+    },
+    mouseout: function(e) {
+      if (iso !== state.countryCode) {
+        geojsonLayer.resetStyle(e.target);
+      }
+    },
+    click: function(e) {
+      selectCountry(iso, geo, feature.properties.ADMIN || feature.properties.name || iso, layer);
+      L.DomEvent.stopPropagation(e);
+    }
+  });
+
+  layer.bindTooltip(
+    "<b>" + (feature.properties.ADMIN || feature.properties.name || iso) + "</b>" +
+    "<br><small>" + (geo.SubRegion || "") + "</small>",
+    { sticky: true, opacity: 0.9 }
+  );
+}
+
+function selectCountry(iso, geo, name, layer) {
+  // Reset previous selected style
+  if (geojsonLayer) geojsonLayer.resetStyle();
+
+  state.countryCode = iso;
+  state.countryName = name;
+  state.region      = geo.Region    || "";
+  state.subRegion   = geo.SubRegion || "";
+
+  // Repaint all layers
+  geojsonLayer.eachLayer(function(l) {
+    if (l.feature) l.setStyle(getStyle(l.feature));
+  });
+
+  // Highlight selected
+  layer.setStyle({ fillColor: COLORS.selected, weight: 2, color: "#015a60", fillOpacity: 1 });
+  layer.bringToFront();
+
+  // Update UI
+  updateBreadcrumb();
+
+  // Popup
+  layer.bindPopup(
+    "<div class='popup-title'>" + name + "</div>" +
+    "<div class='popup-sub'>" + state.subRegion + " · " + state.region + "</div>" +
+    "<button class='popup-btn' onclick='confirmSelection()'>✓ Select " + iso + "</button>"
+  ).openPopup();
+}
+
+function confirmSelection() {
+  map.closePopup();
+  postToParent();
+}
+
+function resetSelection() {
+  state = { region: "", subRegion: "", countryCode: "", countryName: "" };
+  if (geojsonLayer) geojsonLayer.resetStyle();
+  updateBreadcrumb();
+  postToParent();
+}
+
+function updateBreadcrumb() {
+  var bc = document.getElementById("breadcrumb");
+  var btn = document.getElementById("btn-reset");
+  if (state.countryCode) {
+    bc.textContent = state.region + "  ›  " + state.subRegion + "  ›  " + state.countryCode + " " + state.countryName;
+    btn.style.display = "block";
+  } else {
+    bc.textContent = "Click a country to select";
+    btn.style.display = "none";
+  }
+}
+
+// ─── postMessage → Power Apps ────────────────────────────────────────────────
+function postToParent() {
+  var payload = {
+    type: "REGION_SELECTION",
+    region:      state.region,
+    subRegion:   state.subRegion,
+    countryCode: state.countryCode,
+    countryName: state.countryName
+  };
+  // Sends to any parent (Power Apps canvas app host)
+  window.parent.postMessage(JSON.stringify(payload), "*");
+}
+
+// ─── Listen for messages FROM Power Apps ────────────────────────────────────
+// Ex: Power Apps can send { type: "SET_FILTER", region: "Europe" }
+window.addEventListener("message", function(event) {
+  try {
+    var msg = JSON.parse(event.data);
+    if (msg.type === "SET_FILTER") {
+      state.region    = msg.region    || "";
+      state.subRegion = msg.subRegion || "";
+      state.countryCode = "";
+      if (geojsonLayer) geojsonLayer.eachLayer(function(l) {
+        if (l.feature) l.setStyle(getStyle(l.feature));
+      });
+      updateBreadcrumb();
+    }
+    if (msg.type === "RESET") resetSelection();
+  } catch(e) {}
+});
+
+// ─── Load GeoJSON ─────────────────────────────────────────────────────────────
+loadGeoData();
+
+fetch("https://raw.githubusercontent.com/datasets/geo-countries/master/data/countries.geojson")
+  .then(function(r) { return r.json(); })
+  .then(function(data) {
+    geojsonLayer = L.geoJSON(data, {
+      style: getStyle,
+      onEachFeature: onEachFeature
+    }).addTo(map);
+  })
+  .catch(function(e) { console.error("GeoJSON load error", e); });
+</script>
+</body>
+</html>
